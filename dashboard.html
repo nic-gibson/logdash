@@ -1,0 +1,129 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Redis Enterprise log timeline</title>
+<style>
+:root{--bg:#0f1720;--pn:#17212c;--bd:#2a3846;--tx:#d7e0ea;--mu:#8497a9;--ac:#dc382c}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:13px system-ui,sans-serif;display:flex;height:100vh}
+#side{width:260px;background:var(--pn);border-right:1px solid var(--bd);padding:10px;overflow:auto;flex:none}
+#main{flex:1;display:flex;flex-direction:column;min-width:0;padding:10px;gap:8px}
+h1{font-size:15px;margin:0 0 8px;color:#fff}h2{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mu);margin:12px 0 4px;display:flex;justify-content:space-between}
+h2 a{color:var(--ac);cursor:pointer;text-transform:none;letter-spacing:0;margin-left:6px}
+label.i{user-select:none;cursor:pointer;display:flex;gap:6px;align-items:center;padding:1px 0;white-space:nowrap}label.i span.c{color:var(--mu);margin-left:auto;font-size:11px}
+label.i span.n{overflow:hidden;text-overflow:ellipsis}
+input[type=text],select{background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:4px;padding:4px 6px;width:100%}
+#logs{max-height:34vh;overflow:auto;border:1px solid var(--bd);border-radius:4px;padding:3px 5px;margin-top:3px}
+.bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.bar input[type=text]{width:auto}
+button{background:var(--bd);color:var(--tx);border:0;border-radius:4px;padding:5px 10px;cursor:pointer}button:hover{background:#3a4c5e}
+button.p{background:var(--ac);color:#fff}
+#chartw{position:relative;background:var(--pn);border:1px solid var(--bd);border-radius:6px;height:250px;flex:none}
+canvas{width:100%;height:100%;display:block}
+#tip{position:absolute;pointer-events:none;background:#000c;padding:4px 8px;border-radius:4px;font-size:12px;display:none;white-space:pre}
+#leg{display:flex;gap:10px;flex-wrap:wrap;font-size:11px;color:var(--mu)}#leg i{display:inline-block;width:9px;height:9px;margin-right:4px;border-radius:2px}
+#tw{flex:1;overflow:auto;background:var(--pn);border:1px solid var(--bd);border-radius:6px}
+table{border-collapse:collapse;width:100%;font:12px ui-monospace,Menlo,monospace}
+th{position:sticky;top:0;background:#223040;text-align:left;padding:4px 8px;font-family:system-ui}
+td{padding:2px 8px;vertical-align:top;border-top:1px solid #1e2b38;white-space:pre-wrap;word-break:break-all}
+td.m{width:100%}tr.ERROR td.m,tr.CRIT td.m{color:#ff8a80}tr.WARN td.m{color:#ffd180}td.t{white-space:nowrap;color:#9fc}td.nd,td.lg{white-space:nowrap}
+tr.clip td.m{max-height:2.6em;overflow:hidden;display:block}
+.mu{color:var(--mu)}
+</style></head><body>
+<div id="side">
+ <h1>Log timeline</h1>
+ <h2>Nodes <span><a onclick="all_('n',1)">all</a><a onclick="all_('n',0)">none</a></span></h2><div id="nodes"></div>
+ <h2>Levels <span><a onclick="all_('l',1)">all</a><a onclick="all_('l',0)">none</a></span></h2><div id="levels"></div>
+ <h2>Logs <span><a onclick="all_('g',1)">all</a><a onclick="all_('g',0)">none</a><a onclick="inv('g')">invert</a></span></h2>
+ <input type="text" id="lf" placeholder="filter names, then all / none / invert applies to matches"><div class="mu" style="font-size:10.5px;margin:3px 0">Click or drag to toggle · Shift-click for a range · Alt-click for only this</div><div id="logs"></div>
+</div>
+<div id="main">
+ <div class="bar">
+  <input type="text" id="q" placeholder="message contains..." style="width:280px">
+  <label>Colour by <select id="by" style="width:auto"><option>node</option><option>log</option><option>level</option></select></label>
+  <input type="text" id="from" style="width:175px" title="start (UTC)"> → <input type="text" id="to" style="width:175px" title="end (UTC)">
+  <button class="p" onclick="go(true)">Apply</button><button onclick="reset()">Reset zoom</button><button onclick="exp()">Export filtered</button>
+  <span class="mu" id="stat"></span>
+ </div>
+ <div id="chartw"><canvas id="cv"></canvas><div id="tip"></div></div>
+ <div id="leg"></div>
+ <div class="bar"><button onclick="page(-1)">◀ Prev</button><button onclick="page(1)">Next ▶</button>
+  <label><input type="checkbox" id="desc"> newest first</label><span class="mu" id="pg"></span>
+  <span class="mu">Drag on chart to zoom · click a row to expand</span></div>
+ <div id="tw"><table><thead><tr><th>Time (UTC)</th><th>Node</th><th>Log</th><th>Level</th><th>Message</th></tr></thead><tbody id="tb"></tbody></table></div>
+</div>
+<script>
+const $=id=>document.getElementById(id), PAL=['#4e9af1','#f1a24e','#5fcf80','#d96ad9','#e5d04a','#4ed0d0','#f06292','#9e8cff','#aed581','#ff8a65','#90a4ae','#ba68c8'];
+let M,range,sel={n:new Set(),l:new Set(),g:new Set()},H,off=0,PAGE=200,total=null,colors={};
+const iso=t=>new Date(t).toISOString().replace('T',' ').slice(0,19), parse=s=>Date.parse(s.trim().replace(' ','T')+(/Z|\+/.test(s)?'':'Z'));
+const j=u=>fetch(u).then(r=>r.json());
+function qs(extra={}){const p=new URLSearchParams();
+ if(range){p.set('t0',range[0]);p.set('t1',range[1])}
+ const f=(k,key,all)=>{if(sel[k].size<all)p.set(key,[...sel[k]].join(','))};
+ f('n','nodes',M.nodes.length);f('l','levels',M.levels.length);f('g','logs',M.logs.length);
+ if($('q').value)p.set('q',$('q').value);
+ for(const k in extra)p.set(k,extra[k]);return p.toString()}
+function box(id,list,k,fmt){const d=$(id);d.innerHTML='';list.forEach(([v,c])=>{const key=String(v===''?'NONE':v);sel[k].add(key);
+ const l=document.createElement('label');l.className='i';l.dataset.k=key;l.dataset.g=k;l.innerHTML=`<input type=checkbox checked><span class=n>${fmt?fmt(v):key}</span><span class=c>${c.toLocaleString()}</span>`;
+ l.firstChild.onclick=e=>e.preventDefault();   // all toggling handled by the pointer logic below
+ d.appendChild(l)})}
+const IDS={n:'nodes',l:'levels',g:'logs'};
+const items=k=>[...document.querySelectorAll('#'+IDS[k]+' label')].filter(l=>l.style.display!=='none');
+function setItem(l,on){const k=l.dataset.g;l.firstChild.checked=on;on?sel[k].add(l.dataset.k):sel[k].delete(l.dataset.k)}
+let lazy;const apply=()=>{clearTimeout(lazy);lazy=setTimeout(()=>go(true),350)};
+let paint=null,anchor={};
+// click toggles; shift-click selects/deselects a range; click-drag paints; alt-click = only this one
+document.addEventListener('mousedown',e=>{const l=e.target.closest('#side label.i');if(!l||e.button)return;e.preventDefault();
+ const k=l.dataset.g,list=items(k);
+ if(e.altKey){list.forEach(x=>setItem(x,x===l));anchor[k]=l;apply();return}
+ const on=!l.firstChild.checked;
+ if(e.shiftKey&&anchor[k]&&list.includes(anchor[k])){const a=list.indexOf(anchor[k]),b=list.indexOf(l);
+  list.slice(Math.min(a,b),Math.max(a,b)+1).forEach(x=>setItem(x,anchor[k].firstChild.checked))}
+ else{setItem(l,on);anchor[k]=l;paint={k,on}}apply()});
+document.addEventListener('mouseover',e=>{if(!paint||!(e.buttons&1))return;const l=e.target.closest('#side label.i');
+ if(l&&l.dataset.g===paint.k){setItem(l,paint.on);anchor[paint.k]=l;apply()}});
+document.addEventListener('mouseup',()=>{paint=null});
+function all_(k,on){items(k).forEach(l=>setItem(l,!!on));go(true)}
+function inv(k){items(k).forEach(l=>setItem(l,!l.firstChild.checked));go(true)}
+$('lf').oninput=e=>{const v=e.target.value.toLowerCase();document.querySelectorAll('#logs label').forEach(l=>l.style.display=l.dataset.k.toLowerCase().includes(v)?'':'none')};
+function reset(){range=[M.min,M.max+1];go(true)}
+async function go(resetPage){if(resetPage)off=0;
+ $('from').value=iso(range[0]);$('to').value=iso(range[1]-1);
+ const w=$('cv').clientWidth;H=await j('/api/hist?'+qs({by:$('by').value,buckets:Math.max(40,Math.floor(w/6))}));draw();lines()}
+$('from').onchange=$('to').onchange=()=>{const a=parse($('from').value),b=parse($('to').value);if(!isNaN(a)&&!isNaN(b)&&b>=a){range=[a,b+1000]}};
+$('q').onkeydown=e=>{if(e.key==='Enter')go(true)};$('by').onchange=()=>go(false);$('desc').onchange=()=>go(true);
+function col(k){return colors[k]||(colors[k]=PAL[Object.keys(colors).length%PAL.length])}
+let geo;
+function draw(){const cv=$('cv'),dpr=devicePixelRatio||1,W=cv.clientWidth,Ht=cv.clientHeight;cv.width=W*dpr;cv.height=Ht*dpr;
+ const g=cv.getContext('2d');g.scale(dpr,dpr);g.clearRect(0,0,W,Ht);
+ const keys=Object.keys(H.series).sort((a,b)=>H.series[b].reduce((x,y)=>x+y,0)-H.series[a].reduce((x,y)=>x+y,0));
+ const top=keys.slice(0,12);const tot=new Array(H.n).fill(0);
+ keys.forEach(k=>H.series[k].forEach((v,i)=>tot[i]+=v));
+ const mx=Math.max(1,...tot),L=52,R=8,T=8,B=22,pw=W-L-R,ph=Ht-T-B,bw=pw/H.n;geo={L,R,T,B,pw,ph,bw};
+ g.fillStyle='#8497a9';g.font='11px system-ui';g.strokeStyle='#2a3846';
+ for(let i=0;i<=4;i++){const y=T+ph-ph*i/4;g.beginPath();g.moveTo(L,y);g.lineTo(W-R,y);g.stroke();g.fillText(Math.round(mx*i/4).toLocaleString(),4,y+4)}
+ const base=new Array(H.n).fill(0);
+ [...top].reverse().forEach(k=>{g.fillStyle=col(k);H.series[k].forEach((v,i)=>{if(!v)return;const h=ph*v/mx;g.fillRect(L+i*bw,T+ph-ph*base[i]/mx-h,Math.max(1,bw-.5),h);base[i]+=v})});
+ const rest=H.n;let other=keys.slice(12);if(other.length){g.fillStyle='#555';tot.forEach((t,i)=>{const o=t-base[i];if(o>0){const h=ph*o/mx;g.fillRect(L+i*bw,T+ph-ph*base[i]/mx-h,Math.max(1,bw-.5),h)}})}
+ const span=H.size*H.n;for(let i=0;i<=5;i++){const x=L+pw*i/5,t=H.t0+span*i/5;g.fillStyle='#8497a9';const s=iso(t).slice(span>864e5*2?5:5,span>864e5*2?10:16);g.fillText(s,Math.min(x,W-70),Ht-6)}
+ $('leg').innerHTML=top.map(k=>`<span><i style="background:${col(k)}"></i>${$('by').value==='node'?'node_'+k:k}</span>`).join('')+(other.length?`<span><i style="background:#555"></i>${other.length} others</span>`:'');
+ $('stat').textContent=tot.reduce((a,b)=>a+b,0).toLocaleString()+' lines in range · bucket '+(H.size>=6e4?(H.size/6e4).toFixed(1)+' min':(H.size/1e3).toFixed(1)+' s');H.tot=tot;H.keys=keys}
+// drag zoom + tooltip
+let drag=null;const cv=$('cv');
+const xt=e=>{const r=cv.getBoundingClientRect();return [e.clientX-r.left,H.t0+Math.max(0,Math.min(H.n*H.size,(e.clientX-r.left-geo.L)/geo.pw*H.n*H.size))]};
+cv.onmousedown=e=>{drag=xt(e)};
+cv.onmousemove=e=>{if(!H)return;const [x,t]=xt(e),tip=$('tip');const i=Math.floor((t-H.t0)/H.size);
+ if(drag){draw();const g=cv.getContext('2d');g.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);g.fillStyle='#ffffff30';g.fillRect(Math.min(drag[0],x),geo.T,Math.abs(x-drag[0]),geo.ph)}
+ if(i>=0&&i<H.n&&x>=geo.L){tip.style.display='block';tip.style.left=Math.min(x+12,cv.clientWidth-200)+'px';tip.style.top='10px';
+  tip.textContent=iso(H.t0+i*H.size)+'\n'+H.keys.map(k=>[k,H.series[k][i]]).filter(a=>a[1]).sort((a,b)=>b[1]-a[1]).slice(0,8).map(a=>a[0]+': '+a[1].toLocaleString()).join('\n')}else tip.style.display='none'};
+cv.onmouseleave=()=>{$('tip').style.display='none'};
+window.onmouseup=e=>{if(!drag)return;const [x,t]=xt(e);const a=Math.min(drag[1],t),b=Math.max(drag[1],t);drag=null;if(Math.abs(x-xt({clientX:0})[0])>=0&&b-a>=H.size){range=[Math.floor(a),Math.ceil(b)];go(true)}else draw()};
+window.onresize=()=>H&&draw();
+async function lines(){const d=$('desc').checked?1:0;const r=await j('/api/lines?'+qs({limit:PAGE,offset:off,desc:d,count:off===0?1:0}));if(r.total!=null)total=r.total;
+ $('tb').innerHTML=r.rows.map(x=>`<tr class="${x[4]} clip"><td class=t>${x[1]}</td><td class=nd>node_${x[2]}</td><td class=lg>${x[3]}</td><td class=mu>${x[4]}</td><td class=m>${esc(x[5])}</td></tr>`).join('');
+ document.querySelectorAll('#tb tr').forEach(t=>t.onclick=()=>t.classList.toggle('clip'));
+ $('pg').textContent=`rows ${(off+1).toLocaleString()}–${(off+r.rows.length).toLocaleString()} of ${total==null?'?':total.toLocaleString()}`;$('tw').scrollTop=0}
+const esc=s=>s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+function page(d){const n=off+d*PAGE;if(n<0||(total!=null&&n>=total))return;off=n;lines()}
+function exp(){location='/api/export?'+qs()}
+(async()=>{M=await j('/api/meta');range=[M.min,M.max+1];
+ box('nodes',M.nodes,'n',v=>'node_'+v);box('levels',M.levels,'l',v=>v===''?'(none)':v);box('logs',M.logs,'g');
+ $('nodes').querySelectorAll('label').forEach(l=>colors[l.dataset.k]=PAL[(+l.dataset.k-1)%PAL.length]);
+ go(true)})();
+</script></body></html>
